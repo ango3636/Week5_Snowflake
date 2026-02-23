@@ -13,8 +13,6 @@ This repository documents the Snowflake data warehouse configuration for **TruPh
 | Component | Configuration |
 |---|---|
 | Warehouse | `TRUPHARMA_WH` — X-SMALL size |
-| Auto-Suspend | 60 seconds of inactivity |
-| Auto-Resume | Enabled (wakes on query) |
 
 The warehouse is sized for analytical workloads and cost efficiency. Auto-suspend/resume ensures compute costs are minimized during idle periods.
 
@@ -70,8 +68,6 @@ TRUPHARMA_STAGE  ← PUT command uploads files here
       └──► QUERY_INTERACTION_LOGS
 ```
 
-Loading uses `ON_ERROR = CONTINUE` to skip malformed rows without aborting the entire load. The `TRUPHARMA_CSV_FORMAT` handles quoted fields, multiple null representations (`NULL`, `null`, `NA`, `N/A`, empty string), and ISO date/timestamp formats.
-
 ---
 
 ## Analytical Views
@@ -95,31 +91,10 @@ Aggregates RAG query logs by day, drug, and adverse event. Surfaces which topics
 
 ---
 
-## Pre-Built Analysis Queries
-
-| Query | Description |
-|---|---|
-| **Query A** | Overall disparity ranking — highest burden by drug/event/group |
-| **Query B** | 90-day weekly trend for Lisinopril + Angioedema (highest-disparity pair) |
-| **Query C** | Sex-based disparity (Female vs. Male) across all drugs |
-| **Query D** | Summary dashboard card metrics (totals, averages, overall seriousness rate) |
-| **Query E** | Top 10 HIGH DISPARITY drug-event-group combinations for visualization |
-
----
-
 ## Extensions Implemented
 
 ### Disparity Indexing
 The `V_RACIAL_DISPARITY_INDEX` view introduces a calculated **Severity Disparity Index** and **Seriousness Disparity Index**, benchmarking every racial/ethnic group against the White/non-Hispanic baseline. This enables equity-focused reporting aligned with FDA pharmacovigilance standards.
-
-### RAG Pipeline Integration
-The `QUERY_INTERACTION_LOGS` table is purpose-built to capture metadata from a Retrieval-Augmented Generation system (Google Gemini LLM + hybrid retrieval). It logs evidence chunk IDs, retrieval method, confidence scores, and disparity flags — enabling audit trails and performance monitoring of the AI layer.
-
-### Automated Null Handling
-The file format definition handles five null variants (`NULL`, `null`, `''`, `NA`, `N/A`) and uses `EMPTY_FIELD_AS_NULL = TRUE`, preventing data quality issues from inconsistent source file formatting.
-
-### Cost Controls
-The warehouse is configured with `AUTO_SUSPEND = 60` and `AUTO_RESUME = TRUE`, ensuring zero idle compute cost while maintaining full responsiveness for analytical queries.
 
 ---
 
@@ -154,17 +129,4 @@ UNION ALL
 SELECT 'QUERY_INTERACTION_LOGS', COUNT(*) FROM QUERY_INTERACTION_LOGS;
 ```
 
----
 
-## Validation Checklist
-
-- [ ] Row counts returned for both tables after COPY INTO
-- [ ] `SELECT * FROM DRUG_ADVERSE_EVENTS LIMIT 10` returns data
-- [ ] `SELECT * FROM QUERY_INTERACTION_LOGS LIMIT 10` returns data
-- [ ] `SHOW VIEWS IN SCHEMA CLINICAL` lists all 4 views
-- [ ] `SELECT DISTINCT DRUG_NAME FROM DRUG_ADVERSE_EVENTS` returns expected drugs
-- [ ] `SELECT DISTINCT RACE_ETHNICITY FROM DRUG_ADVERSE_EVENTS` returns all demographic groups
-
----
-
-*TruPharma Clinical Intelligence — Drug Safety & Disparity Analysis Platform*
