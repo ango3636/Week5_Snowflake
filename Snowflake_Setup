@@ -1,0 +1,331 @@
+CREATE WAREHOUSE IF NOT EXISTS TRUPHARMA_WH
+    WAREHOUSE_SIZE = 'X-SMALL'
+    AUTO_SUSPEND = 60          -- Pauses after 60 seconds of inactivity (saves cost)
+    AUTO_RESUME = TRUE          -- Wakes up automatically when you run a query
+    COMMENT = 'TruPharma Clinical Intelligence compute warehouse';
+
+-- Activate the warehouse
+USE WAREHOUSE TRUPHARMA_WH;
+
+CREATE DATABASE IF NOT EXISTS TRUPHARMA_DB
+    COMMENT = 'TruPharma Clinical Intelligence — Drug Safety & Disparity Analysis';
+
+-- Switch into the database
+USE DATABASE TRUPHARMA_DB;
+
+-- Create a schema (logical grouping within the database)
+CREATE SCHEMA IF NOT EXISTS CLINICAL
+    COMMENT = 'Clinical adverse event and query log data';
+
+-- Switch into the schema
+USE SCHEMA CLINICAL;
+
+-- Confirm your active context (should show TRUPHARMA_WH / TRUPHARMA_DB / CLINICAL)
+SELECT CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA();
+
+/* ============================================================
+   SECTION 2: CREATE TABLES
+   Defines the structure (columns + data types) for each CSV
+   ============================================================ */
+
+-- TABLE 1: Drug Adverse Events
+-- Source: drug_adverse_events.csv
+-- Purpose: Core fact table for disparity analysis
+CREATE OR REPLACE TABLE DRUG_ADVERSE_EVENTS (
+    DRUG_NAME           VARCHAR(100)    NOT NULL    COMMENT 'Drug brand/generic name',
+    ADVERSE_EVENT       VARCHAR(200)    NOT NULL    COMMENT 'Reported adverse event / side effect',
+    DEMOGRAPHIC_GROUP   VARCHAR(100)                COMMENT 'Combined demographic label',
+    AGE_GROUP           VARCHAR(20)                 COMMENT 'Patient age bracket (e.g. 45-64)',
+    SEX                 CHAR(1)                     COMMENT 'M = Male, F = Female',
+    RACE_ETHNICITY      VARCHAR(100)                COMMENT 'Patient race/ethnicity category',
+    REPORT_DATE         DATE                        COMMENT 'Date adverse event was reported',
+    QUARTER             VARCHAR(10)                 COMMENT 'Fiscal quarter label (e.g. Q4-2024)',
+    DAYS_SINCE_FIRST_REPORT  INT                    COMMENT 'Days elapsed since the first report of this drug-event pair',
+    REPORT_COUNT        INT                         COMMENT 'Total number of reports for this group',
+    SERIOUS_COUNT       INT                         COMMENT 'Number of reports classified as serious',
+    SEVERITY_SCORE      FLOAT                       COMMENT 'Average severity score (0-10 scale)',
+    OUTCOME             VARCHAR(100)                COMMENT 'Patient outcome category',
+    REGION              VARCHAR(50)                 COMMENT 'US geographic region'
+);
+
+-- TABLE 2: Query Interaction Logs
+-- Source: query_interaction_logs.csv
+-- Purpose: Track RAG system usage and flag disparity-related queries
+CREATE OR REPLACE TABLE QUERY_INTERACTION_LOGS (
+    TIMESTAMP               TIMESTAMP_TZ            COMMENT 'UTC timestamp of the query',
+    QUERY                   VARCHAR(500)            COMMENT 'User question text (truncated to 200 chars)',
+    LATENCY_MS              INT                     COMMENT 'End-to-end pipeline latency in milliseconds',
+    EVIDENCE_IDS            VARCHAR(500)            COMMENT 'Pipe-delimited list of retrieved evidence chunk IDs',
+    CONFIDENCE              FLOAT                   COMMENT 'Model confidence score (0-1)',
+    NUM_EVIDENCE            INT                     COMMENT 'Number of evidence chunks returned',
+    NUM_RECORDS             INT                     COMMENT 'Number of FDA drug label records fetched',
+    RETRIEVAL_METHOD        VARCHAR(20)             COMMENT 'hybrid / dense / sparse',
+    LLM_USED                BOOLEAN                 COMMENT 'Whether Google Gemini LLM was invoked',
+    ANSWER_PREVIEW          VARCHAR(300)            COMMENT 'First 150 characters of the generated answer',
+    DRUG_MENTIONED          VARCHAR(100)            COMMENT 'Drug name detected in the query (if any)',
+    ADVERSE_EVENT_FLAGGED   VARCHAR(100)            COMMENT 'Adverse event detected in the query (if any)',
+    DISPARITY_FLAG          BOOLEAN                 COMMENT 'TRUE if query relates to demographic/racial disparity',
+    SESSION_ID              VARCHAR(20)             COMMENT 'Unique session identifier'
+);
+
+-- Verify both tables were created
+SHOW TABLES IN SCHEMA CLINICAL;
+
+/* ============================================================
+   SECTION 3: CREATE FILE FORMAT & STAGE
+   A "stage" is a temporary holding area for your CSV files.
+   A "file format" tells Snowflake how to read them.
+   ============================================================ */
+
+-- Define how Snowflake should parse CSV files
+CREATE OR REPLACE FILE FORMAT TRUPHARMA_CSV_FORMAT
+    TYPE = 'CSV'
+    FIELD_DELIMITER = ','
+    RECORD_DELIMITER = '\n'
+    SKIP_HEADER = 1             -- Skip the first row (column headers)
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"'  -- Handle fields wrapped in quotes
+    NULL_IF = ('NULL', 'null', '', 'NA', 'N/A')
+    EMPTY_FIELD_AS_NULL = TRUE
+    DATE_FORMAT = 'YYYY-MM-DD'
+    TIMESTAMP_FORMAT = 'YYYY-MM-DDTHH24:MI:SSZ'
+    COMMENT = 'Standard CSV format for TruPharma data files';
+
+-- Create an internal stage (Snowflake-managed storage area)
+CREATE OR REPLACE STAGE TRUPHARMA_STAGE
+    FILE_FORMAT = TRUPHARMA_CSV_FORMAT
+    COMMENT = 'Upload CSVs here before loading into tables';
+
+
+
+COPY INTO DRUG_ADVERSE_EVENTS
+    FROM @TRUPHARMA_STAGE/drug_adverse_events.csv
+    FILE_FORMAT = (FORMAT_NAME = 'TRUPHARMA_CSV_FORMAT')
+    ON_ERROR = 'CONTINUE';   -- Skip bad rows instead of failing the whole load
+
+COPY INTO QUERY_INTERACTION_LOGS
+    FROM @TRUPHARMA_STAGE/query_interaction_logs.csv
+    FILE_FORMAT = (FORMAT_NAME = 'TRUPHARMA_CSV_FORMAT')
+    ON_ERROR = 'CONTINUE';
+
+-- Verify row counts after loading
+SELECT 'DRUG_ADVERSE_EVENTS'   AS table_name, COUNT(*) AS row_count FROM DRUG_ADVERSE_EVENTS
+UNION ALL
+SELECT 'QUERY_INTERACTION_LOGS', COUNT(*) FROM QUERY_INTERACTION_LOGS;
+
+/* ============================================================
+   SECTION 5: VALIDATION QUERIES
+   Run these to confirm data loaded correctly
+   ============================================================ */
+
+-- Preview adverse events table
+SELECT * FROM DRUG_ADVERSE_EVENTS LIMIT 10;
+
+-- Preview query logs table
+SELECT * FROM QUERY_INTERACTION_LOGS LIMIT 10;
+
+-- Check date range of adverse event data
+SELECT
+    MIN(REPORT_DATE) AS earliest_report,
+    MAX(REPORT_DATE) AS latest_report,
+    DATEDIFF('day', MIN(REPORT_DATE), MAX(REPORT_DATE)) AS date_span_days
+FROM DRUG_ADVERSE_EVENTS;
+
+-- Confirm all expected drugs are present
+SELECT DISTINCT DRUG_NAME FROM DRUG_ADVERSE_EVENTS ORDER BY 1;
+
+-- Confirm all race/ethnicity groups are present
+SELECT DISTINCT RACE_ETHNICITY, COUNT(*) AS records
+FROM DRUG_ADVERSE_EVENTS
+GROUP BY 1
+ORDER BY 2 DESC;
+
+/* ============================================================
+   SECTION 6: VIEWS FOR DISPARITY ANALYSIS
+   Views are saved queries — think of them as "smart tables"
+   that always show fresh results when you query them.
+   ============================================================ */
+
+-- VIEW 1: 90-Day Disparity Summary
+-- Core view for your disparity visualization
+-- Shows report counts and severity broken down by demographic group
+CREATE OR REPLACE VIEW V_90DAY_DISPARITY_SUMMARY AS
+SELECT
+    DRUG_NAME,
+    ADVERSE_EVENT,
+    RACE_ETHNICITY,
+    SEX,
+    AGE_GROUP,
+    REGION,
+    QUARTER,
+    COUNT(*)                                        AS group_segments,
+    SUM(REPORT_COUNT)                               AS total_reports,
+    SUM(SERIOUS_COUNT)                              AS total_serious,
+    ROUND(AVG(SEVERITY_SCORE), 2)                   AS avg_severity_score,
+    ROUND(SUM(SERIOUS_COUNT) / NULLIF(SUM(REPORT_COUNT), 0) * 100, 1) AS pct_serious,
+    MIN(REPORT_DATE)                                AS first_report_date,
+    MAX(REPORT_DATE)                                AS last_report_date,
+    DATEDIFF('day', MIN(REPORT_DATE), MAX(REPORT_DATE)) AS observation_days
+FROM DRUG_ADVERSE_EVENTS
+GROUP BY 1,2,3,4,5,6,7;
+
+-- VIEW 2: Racial Disparity Index
+-- Compares each race/ethnicity group to the White baseline per drug-event pair
+-- Disparity Index > 1.0 means elevated burden; < 1.0 means lower burden
+CREATE OR REPLACE VIEW V_RACIAL_DISPARITY_INDEX AS
+WITH baseline AS (
+    -- Get White/non-Hispanic stats as the reference group
+    SELECT
+        DRUG_NAME,
+        ADVERSE_EVENT,
+        AVG(SEVERITY_SCORE)                         AS baseline_severity,
+        SUM(SERIOUS_COUNT) / NULLIF(SUM(REPORT_COUNT), 0) AS baseline_seriousness_rate
+    FROM DRUG_ADVERSE_EVENTS
+    WHERE RACE_ETHNICITY = 'White'
+    GROUP BY 1, 2
+),
+all_groups AS (
+    SELECT
+        DRUG_NAME,
+        ADVERSE_EVENT,
+        RACE_ETHNICITY,
+        SUM(REPORT_COUNT)                           AS total_reports,
+        SUM(SERIOUS_COUNT)                          AS total_serious,
+        AVG(SEVERITY_SCORE)                         AS avg_severity,
+        SUM(SERIOUS_COUNT) / NULLIF(SUM(REPORT_COUNT), 0) AS seriousness_rate
+    FROM DRUG_ADVERSE_EVENTS
+    GROUP BY 1, 2, 3
+)
+SELECT
+    a.DRUG_NAME,
+    a.ADVERSE_EVENT,
+    a.RACE_ETHNICITY,
+    a.TOTAL_REPORTS,
+    a.TOTAL_SERIOUS,
+    ROUND(a.AVG_SEVERITY, 2)                        AS avg_severity,
+    ROUND(a.SERIOUSNESS_RATE * 100, 1)              AS pct_serious,
+    -- Disparity index: how does this group compare to White baseline?
+    ROUND(a.AVG_SEVERITY / NULLIF(b.BASELINE_SEVERITY, 0), 2)              AS severity_disparity_index,
+    ROUND(a.SERIOUSNESS_RATE / NULLIF(b.BASELINE_SERIOUSNESS_RATE, 0), 2)  AS seriousness_disparity_index,
+    CASE
+        WHEN a.AVG_SEVERITY / NULLIF(b.BASELINE_SEVERITY, 0) >= 1.2  THEN 'HIGH DISPARITY'
+        WHEN a.AVG_SEVERITY / NULLIF(b.BASELINE_SEVERITY, 0) >= 1.05 THEN 'MODERATE DISPARITY'
+        ELSE 'COMPARABLE'
+    END                                             AS disparity_flag
+FROM all_groups a
+LEFT JOIN baseline b
+    ON a.DRUG_NAME = b.DRUG_NAME
+    AND a.ADVERSE_EVENT = b.ADVERSE_EVENT
+ORDER BY severity_disparity_index DESC NULLS LAST;
+
+-- VIEW 3: 90-Day Trend (Weekly Buckets)
+-- Tracks how report counts and severity change week over week
+-- Useful for trend line charts in Tableau/Looker/Snowsight
+CREATE OR REPLACE VIEW V_90DAY_WEEKLY_TREND AS
+SELECT
+    DRUG_NAME,
+    ADVERSE_EVENT,
+    RACE_ETHNICITY,
+    DATE_TRUNC('week', REPORT_DATE)                 AS week_start,
+    FLOOR(DAYS_SINCE_FIRST_REPORT / 7) + 1          AS week_number,
+    SUM(REPORT_COUNT)                               AS weekly_reports,
+    SUM(SERIOUS_COUNT)                              AS weekly_serious,
+    ROUND(AVG(SEVERITY_SCORE), 2)                   AS avg_weekly_severity
+FROM DRUG_ADVERSE_EVENTS
+WHERE DAYS_SINCE_FIRST_REPORT <= 90
+GROUP BY 1,2,3,4,5
+ORDER BY DRUG_NAME, ADVERSE_EVENT, RACE_ETHNICITY, week_start;
+
+-- VIEW 4: Query Log Disparity Activity
+-- Shows which drugs and adverse events are being researched most
+-- and how often disparity-related questions are asked
+CREATE OR REPLACE VIEW V_QUERY_DISPARITY_ACTIVITY AS
+SELECT
+    DATE_TRUNC('day', TIMESTAMP)                    AS query_date,
+    DRUG_MENTIONED,
+    ADVERSE_EVENT_FLAGGED,
+    RETRIEVAL_METHOD,
+    COUNT(*)                                        AS total_queries,
+    SUM(CASE WHEN DISPARITY_FLAG THEN 1 ELSE 0 END) AS disparity_queries,
+    ROUND(AVG(CONFIDENCE), 3)                       AS avg_confidence,
+    ROUND(AVG(LATENCY_MS), 0)                       AS avg_latency_ms,
+    ROUND(SUM(CASE WHEN DISPARITY_FLAG THEN 1 ELSE 0 END) /
+          NULLIF(COUNT(*), 0) * 100, 1)             AS pct_disparity_queries
+FROM QUERY_INTERACTION_LOGS
+GROUP BY 1,2,3,4
+ORDER BY query_date, disparity_queries DESC;
+
+-- Confirm all views were created
+SHOW VIEWS IN SCHEMA CLINICAL;
+
+
+/* ============================================================
+   SECTION 7: KEY ANALYSIS QUERIES
+   Pre-built queries for your 90-day disparity analysis.
+   Run these directly or connect via BI tool (Tableau, Looker,
+   Snowsight, Power BI, etc.)
+   ============================================================ */
+
+-- QUERY A: Overall disparity ranking — which drug/event/group has the highest burden?
+SELECT
+    DRUG_NAME,
+    ADVERSE_EVENT,
+    RACE_ETHNICITY,
+    TOTAL_REPORTS,
+    AVG_SEVERITY,
+    PCT_SERIOUS,
+    SEVERITY_DISPARITY_INDEX,
+    DISPARITY_FLAG
+FROM V_RACIAL_DISPARITY_INDEX
+WHERE RACE_ETHNICITY != 'White'    -- Exclude baseline for cleaner view
+ORDER BY SEVERITY_DISPARITY_INDEX DESC;
+
+-- QUERY B: 90-day trend for the highest-disparity drug-event pair
+-- (Lisinopril + Angioedema in Black/African American patients)
+SELECT
+    WEEK_NUMBER,
+    WEEK_START,
+    RACE_ETHNICITY,
+    WEEKLY_REPORTS,
+    WEEKLY_SERIOUS,
+    AVG_WEEKLY_SEVERITY
+FROM V_90DAY_WEEKLY_TREND
+WHERE DRUG_NAME = 'Lisinopril'
+  AND ADVERSE_EVENT = 'Angioedema'
+ORDER BY WEEK_NUMBER, RACE_ETHNICITY;
+
+-- QUERY C: Sex-based disparity (Female vs Male) across all drugs
+SELECT
+    DRUG_NAME,
+    ADVERSE_EVENT,
+    SEX,
+    SUM(REPORT_COUNT)           AS total_reports,
+    ROUND(AVG(SEVERITY_SCORE), 2) AS avg_severity,
+    ROUND(SUM(SERIOUS_COUNT) / NULLIF(SUM(REPORT_COUNT), 0) * 100, 1) AS pct_serious
+FROM DRUG_ADVERSE_EVENTS
+GROUP BY 1, 2, 3
+ORDER BY DRUG_NAME, ADVERSE_EVENT, SEX;
+
+-- QUERY D: Summary dashboard card metrics
+SELECT
+    COUNT(DISTINCT DRUG_NAME)               AS drugs_monitored,
+    COUNT(DISTINCT ADVERSE_EVENT)           AS adverse_events_tracked,
+    COUNT(DISTINCT RACE_ETHNICITY)          AS demographic_groups,
+    SUM(REPORT_COUNT)                       AS total_reports_90_days,
+    SUM(SERIOUS_COUNT)                      AS total_serious_events,
+    ROUND(AVG(SEVERITY_SCORE), 2)           AS overall_avg_severity,
+    ROUND(SUM(SERIOUS_COUNT) / NULLIF(SUM(REPORT_COUNT), 0) * 100, 1) AS overall_pct_serious
+FROM DRUG_ADVERSE_EVENTS;
+
+-- QUERY E: Top 5 highest-disparity findings (ready for visualization)
+SELECT
+    DRUG_NAME || ' — ' || ADVERSE_EVENT    AS drug_event_pair,
+    RACE_ETHNICITY,
+    SEVERITY_DISPARITY_INDEX,
+    SERIOUSNESS_DISPARITY_INDEX,
+    TOTAL_REPORTS,
+    DISPARITY_FLAG
+FROM V_RACIAL_DISPARITY_INDEX
+WHERE RACE_ETHNICITY NOT IN ('White')
+  AND DISPARITY_FLAG = 'HIGH DISPARITY'
+ORDER BY SEVERITY_DISPARITY_INDEX DESC
+LIMIT 10;
