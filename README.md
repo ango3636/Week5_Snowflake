@@ -2,8 +2,7 @@
 
 ## Overview
 
-This repository documents the Snowflake data warehouse configuration for **TruPharma Clinical Intelligence**, a drug safety and demographic disparity analysis platform. The system ingests FDA adverse event data, tracks RAG (Retrieval-Augmented Generation) query interactions, and surfaces equity-focused insights across demographic groups.
-
+Demo Video on Youtube: https://youtu.be/_0AVp3bdrY4
 ---
 
 ## System Architecture
